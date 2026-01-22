@@ -272,7 +272,7 @@ async def broadcast_to_users(
     success_count = 0
     failed_ids = []
     skipped_blocked = 0
-    auto_blocked_total = 0
+    skipped_unreachable_total = 0
 
     async def send_one(uid):
         attempts = 0
@@ -341,7 +341,7 @@ async def broadcast_to_users(
                     logging.error(f"Network error for {uid}: {e}")
                     return ("failed", uid)
             except (Forbidden, BadRequest):
-                return ("auto_blocked", uid)
+                return ("skipped", uid)
             except Exception as e:
                 attempts += 1
                 if attempts >= max_attempts:
@@ -356,7 +356,7 @@ async def broadcast_to_users(
         chunk = users_list[idx: idx + batch_size]
         idx += batch_size
 
-        chunk_auto_blocked = []
+        chunk_skipped_unreachable = []
         targets = []
         for uid in chunk:
             if uid in blocked_set:
@@ -371,25 +371,18 @@ async def broadcast_to_users(
         for status, uid in results:
             if status == "success":
                 success_count += 1
-            elif status == "auto_blocked":
-                chunk_auto_blocked.append(uid)
+            elif status == "skipped":
+                chunk_skipped_unreachable.append(uid)
             else:
                 failed_ids.append(uid)
 
-        if chunk_auto_blocked:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for uid in chunk_auto_blocked:
-                c.execute(
-                    "INSERT OR IGNORE INTO blocked_users (user_id, blocked_by, blocked_date, reason) VALUES (?, ?, ?, ?)",
-                    (int(uid), 0, now, "bot_blocked")
-                )
-            conn.commit()
-            auto_blocked_total += len(chunk_auto_blocked)
+        if chunk_skipped_unreachable:
+            skipped_unreachable_total += len(chunk_skipped_unreachable)
 
         if batch_pause:
             await asyncio.sleep(batch_pause)
 
-    return success_count, failed_ids, skipped_blocked, auto_blocked_total
+    return success_count, failed_ids, skipped_blocked, skipped_unreachable_total
 
 def get_statistics():
     c.execute("SELECT COUNT(*) FROM users")
@@ -523,6 +516,23 @@ def delete_film(code):
     c.execute("DELETE FROM film_parts WHERE film_code = ?", (code,))
     conn.commit()
 
+def update_film_file(code, file_id, file_type):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("UPDATE films SET file_id = ?, file_type = ?, upload_date = ? WHERE code = ?", (file_id, file_type, now, code))
+    conn.commit()
+
+def update_film_part_caption(film_code, part_number, new_caption):
+    c.execute("UPDATE film_parts SET caption = ? WHERE film_code = ? AND part_number = ?", (new_caption, film_code, part_number))
+    conn.commit()
+
+def update_film_part_file(film_code, part_number, file_id, file_type):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("UPDATE film_parts SET file_id = ?, file_type = ?, upload_date = ? WHERE film_code = ? AND part_number = ?", (file_id, file_type, now, film_code, part_number))
+    conn.commit()
+
+def delete_film_part(film_code, part_number):
+    c.execute("DELETE FROM film_parts WHERE film_code = ? AND part_number = ?", (film_code, part_number))
+    conn.commit()
 def get_film_by_code(code):
     c.execute("SELECT file_id, file_type, caption FROM films WHERE code = ?", (code,))
     result = c.fetchone()
@@ -550,19 +560,20 @@ async def is_member(user_id):
     for channel_username, channel_type, display_name, invite_link in channels:
         if channel_type == "Telegram":
             try:
+                # Skip invite-link style entries entirely (t.me/+ or joinchat), and any http t.me links
+                lower = (channel_username or "").lower()
+                if channel_username.startswith("http") or "t.me/+" in lower or "t.me/joinchat" in lower:
+                    continue
                 # Handle channel ID (starts with -100) or username (@...)
                 chat_id = channel_username if channel_username.startswith("-100") else channel_username
-                
                 # Self-healing: Try to get invite link if missing
                 if not invite_link:
                     try:
                         invite_link = await app.bot.export_chat_invite_link(chat_id)
-                        # Update DB
                         c.execute("UPDATE channels SET invite_link = ? WHERE channel_username = ?", (invite_link, channel_username))
                         conn.commit()
                     except Exception as e:
                         logging.error(f"Invite link olishda xatolik ({channel_username}): {e}")
-
                 member = await app.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
                 if member.status not in ["member", "creator", "administrator"]:
                     not_joined.append((channel_username, display_name, invite_link))
@@ -614,8 +625,10 @@ def get_admin_settings_keyboard():
         [InlineKeyboardButton("➖ Admin o'chirish", callback_data="admin_remove")],
         [InlineKeyboardButton("🚫 User bloklash", callback_data="user_block")],
         [InlineKeyboardButton("✅ User blokdan chiqarish", callback_data="user_unblock")],
-        [InlineKeyboardButton("� Bot haqida tahrirlash", callback_data="edit_about_text")],
-        [InlineKeyboardButton("� Users.db yuklab olish", callback_data="download_db")],
+        [InlineKeyboardButton("⛔ Bloklanganlar ro'yxati", callback_data="list_blocked")],
+        [InlineKeyboardButton("📥 Bloklanganlar fayli", callback_data="download_blocked")],
+        [InlineKeyboardButton("🤖 Bot haqida tahrirlash", callback_data="edit_about_text")],
+        [InlineKeyboardButton("📥 Users.db yuklab olish", callback_data="download_db")],
         [InlineKeyboardButton("📋 Admin loglarini yuklab olish", callback_data="download_logs")],
         [InlineKeyboardButton("👤 Admin huquqlarini o'zgartirish", callback_data="admin_perms")],
         [InlineKeyboardButton("⬅ Orqaga", callback_data="back_main")],
@@ -657,30 +670,15 @@ def get_channel_post_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
     if is_blocked(user.id):
         await update.message.reply_text("❌ Siz bloklangansiz. Bot adminiga murojaat qiling.\n\n🧑‍💻 @JavohirJalilovv")
         return
-
-    not_joined = await is_member(user.id)
-    if not_joined:
-        await update.message.reply_text(
-            "⚠️ <b>DIQQAT!</b>\n\n"
-            "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling va <b>'✅ Tekshirish'</b> tugmasini bosing:",
-            parse_mode='HTML',
-            reply_markup=get_subscription_keyboard(not_joined)
-        )
-        return
-
-    save_user(user.id)
-    
-    # Check for deep linking arguments
-    if context.args:
-        code = context.args[0]
-        await send_film_logic(update, context, code)
-        return
-
     if is_admin(user.id):
+        save_user(user.id)
+        if context.args:
+            code = context.args[0]
+            await send_film_logic(update, context, code)
+            return
         await update.message.reply_text(
             "🎛 <b>ADMIN PANEL</b>\n\n"
             "Xush kelibsiz! Admin panelidan foydalaning.\n\n"
@@ -695,11 +693,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML',
             reply_markup=get_admin_main_keyboard()
         )
-    else:
+        return
+    not_joined = await is_member(user.id)
+    if not_joined:
         await update.message.reply_text(
-            "✍️ Film kodini yuboring",
-            reply_markup=get_user_keyboard()
+            "⚠️ <b>DIQQAT!</b>\n\n"
+            "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling va <b>'✅ Tekshirish'</b> tugmasini bosing:",
+            parse_mode='HTML',
+            reply_markup=get_subscription_keyboard(not_joined)
         )
+        return
+    save_user(user.id)
+    if context.args:
+        code = context.args[0]
+        await send_film_logic(update, context, code)
+        return
+    await update.message.reply_text(
+        "✍️ Film kodini yuboring",
+        reply_markup=get_user_keyboard()
+    )
 
 async def send_film_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
     film = get_film_by_code(code)
@@ -820,16 +832,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Siz bloklangansiz. Bot adminiga murojaat qiling.\n\n🧑‍💻 @JavohirJalilovv")
         return
 
-    not_joined = await is_member(user.id)
-    if not_joined:
-        await update.message.reply_text(
-            "⚠️ <b>DIQQAT!</b>\n\n"
-            "Siz botning majburiy kanallaridan chiqib ketgansiz yoki hali a'zo emassiz.\n"
-            "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling va <b>'✅ Tekshirish'</b> tugmasini bosing:", 
-            parse_mode='HTML',
-            reply_markup=get_subscription_keyboard(not_joined)
-        )
-        return
+    if not is_admin(user.id):
+        not_joined = await is_member(user.id)
+        if not_joined:
+            await update.message.reply_text(
+                "⚠️ <b>DIQQAT!</b>\n\n"
+                "Siz botning majburiy kanallaridan chiqib ketgansiz yoki hali a'zo emassiz.\n"
+                "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling va <b>'✅ Tekshirish'</b> tugmasini bosing:", 
+                parse_mode='HTML',
+                reply_markup=get_subscription_keyboard(not_joined)
+            )
+            return
 
     save_user(user.id)
     text = update.message.text.strip() if update.message.text else ""
@@ -955,27 +968,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Xatolik: {e}")
             return
-
-        # Ask for Schedule
-        schedule_keyboard = [
-            [InlineKeyboardButton("Hozir yuborish", callback_data="post_schedule_now")],
-            [InlineKeyboardButton("1 soatdan keyin", callback_data="post_schedule_1h"),
-             InlineKeyboardButton("2 soatdan keyin", callback_data="post_schedule_2h")],
-            [InlineKeyboardButton("3 soatdan keyin", callback_data="post_schedule_3h"),
-             InlineKeyboardButton("4 soatdan keyin", callback_data="post_schedule_4h")],
-            [InlineKeyboardButton("5 soatdan keyin", callback_data="post_schedule_5h"),
-             InlineKeyboardButton("6 soatdan keyin", callback_data="post_schedule_6h")],
-            [InlineKeyboardButton("7 soatdan keyin", callback_data="post_schedule_7h"),
-             InlineKeyboardButton("8 soatdan keyin", callback_data="post_schedule_8h")],
-            [InlineKeyboardButton("9 soatdan keyin", callback_data="post_schedule_9h"),
-             InlineKeyboardButton("10 soatdan keyin", callback_data="post_schedule_10h")],
-             [InlineKeyboardButton("❌ Bekor qilish", callback_data="post_cancel")]
-        ]
+        
+        # Ask for target channel
+        channels = get_all_channels()
+        telegram_channels = [(u, t, n, l) for (u, t, n, l) in channels if t == "Telegram"]
+        if not telegram_channels:
+            await update.message.reply_text(
+                "❌ Hech qanday Telegram kanal topilmadi. Avval kanal qo'shing.",
+                parse_mode='HTML'
+            )
+            return
+        
+        context.user_data["post_available_channels"] = telegram_channels
+        
+        kb = []
+        for idx, (username, ch_type, display_name, invite_link) in enumerate(telegram_channels):
+            name = display_name if display_name else username
+            kb.append([InlineKeyboardButton(name, callback_data=f"post_target_idx_{idx}")])
+        kb.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="post_cancel")])
         
         await update.message.reply_text(
-            "⏰ <b>QACHON YUBORILISIN?</b>\n\nVaqtni tanlang:",
+            "📡 <b>QAYSI KANALGA YUBORILSIN?</b>\n\nKanalni tanlang:",
             parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(schedule_keyboard)
+            reply_markup=InlineKeyboardMarkup(kb)
         )
         return
 
@@ -1024,56 +1039,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "⚙ Admin sozlamalari":
-        await update.message.reply_text(
-            "⚙ <b>ADMIN SOZLAMALARI</b>\n\n"
-            "Quyidagi amallardan birini tanlang:",
-            parse_mode='HTML',
-            reply_markup=get_admin_settings_keyboard()
-        )
+        if is_admin(user.id):
+            await update.message.reply_text(
+                "⚙ <b>ADMIN SOZLAMALARI</b>\n\n"
+                "Quyidagi amallardan birini tanlang:",
+                parse_mode='HTML',
+                reply_markup=get_admin_settings_keyboard()
+            )
         return
 
     if text == "📡 Kanal sozlamalari":
-        await update.message.reply_text(
-            "📡 <b>KANAL SOZLAMALARI</b>\n\n"
-            "Majburiy kanallarni boshqaring:",
-            parse_mode='HTML',
-            reply_markup=get_channel_settings_keyboard()
-        )
+        if is_admin(user.id):
+            await update.message.reply_text(
+                "📡 <b>KANAL SOZLAMALARI</b>\n\n"
+                "Majburiy kanallarni boshqaring:",
+                parse_mode='HTML',
+                reply_markup=get_channel_settings_keyboard()
+            )
         return
 
     if text == "🎬 Film sozlamalari":
-        await update.message.reply_text(
-            "🎬 <b>FILM SOZLAMALARI</b>\n\n"
-            "Filmlarni boshqaring:",
-            parse_mode='HTML',
-            reply_markup=get_film_settings_keyboard()
-        )
+        if is_admin(user.id):
+            await update.message.reply_text(
+                "🎬 <b>FILM SOZLAMALARI</b>\n\n"
+                "Filmlarni boshqaring:",
+                parse_mode='HTML',
+                reply_markup=get_film_settings_keyboard()
+            )
         return
 
     if text == "📢 Reklama":
-        keyboard = [
-            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_reklama")],
-            [InlineKeyboardButton("⬅ Asosiy menyu", callback_data="back_main")]
-        ]
-        await update.message.reply_text(
-            "📢 <b>REKLAMA YUBORISH</b>\n\n"
-            "Reklama sifatida quyidagilarni yuborishingiz mumkin:\n\n"
-            "📸 Rasm, 🎥 Video, 📄 Hujjat, 🎵 Audio, 🎤 Ovozli xabar, 💬 Matn\n\n"
-            "📝 Media yuborgan holda, caption qo'shishingiz mumkin.\n\n"
-            "⚠️ Keyingi xabaringiz reklama sifatida qabul qilinadi!",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        context.user_data["reklama_mode"] = True
+        if is_admin(user.id):
+            keyboard = [
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_reklama")],
+                [InlineKeyboardButton("⬅ Asosiy menyu", callback_data="back_main")]
+            ]
+            await update.message.reply_text(
+                "📢 <b>REKLAMA YUBORISH</b>\n\n"
+                "Reklama sifatida quyidagilarni yuborishingiz mumkin:\n\n"
+                "📸 Rasm, 🎥 Video, 📄 Hujjat, 🎵 Audio, 🎤 Ovozli xabar, 💬 Matn\n\n"
+                "📝 Media yuborgan holda, caption qo'shishingiz mumkin.\n\n"
+                "⚠️ Keyingi xabaringiz reklama sifatida qabul qilinadi!",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            context.user_data["reklama_mode"] = True
         return
 
     if text == "🔗 Kanalga post":
-        await update.message.reply_text(
-            "🔗 <b>KANALGA POST YARATISH</b>\n\n"
-            "Post yaratish uchun quyidagi tugmani bosing:",
-            parse_mode='HTML',
-            reply_markup=get_channel_post_keyboard()
-        )
+        if is_admin(user.id):
+            await update.message.reply_text(
+                "🔗 <b>KANALGA POST YARATISH</b>\n\n"
+                "Post yaratish uchun quyidagi tugmani bosing:",
+                parse_mode='HTML',
+                reply_markup=get_channel_post_keyboard()
+            )
         return
 
     if text == "ℹ️ Bot haqida":
@@ -1317,8 +1337,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("waiting_channel_username"):
         channel_username = text.strip()
-        if channel_username.startswith("@") or channel_username.startswith("http") or channel_username.startswith("-100"):
-            channel_type = "Telegram" if channel_username.startswith("@") or channel_username.startswith("-100") else "Web"
+        if channel_username.startswith("@") or channel_username.startswith("-100") or channel_username.startswith("http"):
+            if channel_username.startswith("http"):
+                lower = channel_username.lower()
+                if "t.me" in lower:
+                    await update.message.reply_text(
+                        "❌ Telegram kanalni <b>taklif havolasi</b> orqali qo'shish taqiqlangan.\n"
+                        "Iltimos, kanalni <b>@username</b> yoki <b>-100… ID</b> bilan yuboring.",
+                        parse_mode='HTML'
+                    )
+                    return
+                channel_type = "Web"
+            else:
+                channel_type = "Telegram"
             keyboard = [
                 [InlineKeyboardButton("✅ Qo'shish", callback_data=f"confirm_add_channel_{channel_username}_{channel_type}")],
                 [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_action")]
@@ -1514,13 +1545,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["edit_film_code"] = text
             context.user_data["waiting_film_code_edit"] = False
             current_caption = film['caption'] or "Yo'q"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Film captionni tahrirlash", callback_data=f"film_edit_caption_{text}")],
+                [InlineKeyboardButton("🎞 Film faylini yangilash", callback_data=f"film_edit_file_{text}")],
+                [InlineKeyboardButton("🧩 Qismlar ro'yxati", callback_data=f"film_parts_list_{text}")],
+                [InlineKeyboardButton("⬅ Orqaga", callback_data="show_film_settings")]
+            ])
             await update.message.reply_text(
                 f"Film: <code>{text}</code>\n\n"
                 f"Joriy caption: <i>{current_caption}</i>\n\n"
-                f"Yangi captionni yuboring:",
-                parse_mode='HTML'
+                f"Tanlang:",
+                parse_mode='HTML',
+                reply_markup=keyboard
             )
-            context.user_data["waiting_new_caption"] = True
         else:
             await update.message.reply_text("❌ Bu kodda film topilmadi!")
             context.user_data.clear()
@@ -1533,6 +1570,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_admin_action(user.id, "Film tahrirlandi", f"Kod: {film_code}")
             await update.message.reply_text("✅ Film caption yangilandi!")
             context.user_data.clear()
+        return
+    
+    if context.user_data.get("waiting_main_film_file_update"):
+        if update.message.video or update.message.document:
+            film_code = context.user_data.get("edit_film_code")
+            if update.message.video:
+                file_id = update.message.video.file_id
+                file_type = "video"
+            else:
+                file_id = update.message.document.file_id
+                file_type = "document"
+            update_film_file(film_code, file_id, file_type)
+            log_admin_action(user.id, "Film fayli yangilandi", f"Kod: {film_code}")
+            await update.message.reply_text("✅ Film fayli yangilandi!", reply_markup=get_film_settings_keyboard())
+            context.user_data.clear()
+        else:
+            await update.message.reply_text("❌ Iltimos, video yoki hujjat yuboring!")
+        return
+
+    if context.user_data.get("waiting_part_file_update"):
+        if update.message.video or update.message.document:
+            film_code = context.user_data.get("edit_part_film_code")
+            part_number = context.user_data.get("edit_part_number")
+            if update.message.video:
+                file_id = update.message.video.file_id
+                file_type = "video"
+            else:
+                file_id = update.message.document.file_id
+                file_type = "document"
+            update_film_part_file(film_code, part_number, file_id, file_type)
+            log_admin_action(user.id, "Film qismi tahrirlandi (fayl)", f"Kod: {film_code}, Part: {part_number}")
+            await update.message.reply_text("✅ Qism fayli yangilandi!", reply_markup=get_film_settings_keyboard())
+            context.user_data.clear()
+        else:
+            await update.message.reply_text("❌ Iltimos, video yoki hujjat yuboring!")
+        return
+
+    if context.user_data.get("waiting_part_caption_update"):
+        film_code = context.user_data.get("edit_part_film_code")
+        part_number = context.user_data.get("edit_part_number")
+        update_film_part_caption(film_code, part_number, text)
+        log_admin_action(user.id, "Film qismi tahrirlandi (caption)", f"Kod: {film_code}, Part: {part_number}")
+        await update.message.reply_text("✅ Qism caption yangilandi!", reply_markup=get_film_settings_keyboard())
+        context.user_data.clear()
         return
 
     if context.user_data.get("waiting_film_search_query"):
@@ -1558,14 +1639,18 @@ async def send_channel_post(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     data = job.data
     
-    main_channel = get_bot_setting("main_channel")
-    if not main_channel:
-        main_channel = CHANNEL_USERNAME
-        
-    chat_id = main_channel if main_channel.startswith("-100") else (main_channel if main_channel.startswith("@") else None)
+    target_channel = data.get("target_channel")
+    chat_id = None
+    if target_channel:
+        chat_id = target_channel if target_channel.startswith("-100") else target_channel
+    else:
+        main_channel = get_bot_setting("main_channel")
+        if not main_channel:
+            main_channel = CHANNEL_USERNAME
+        chat_id = main_channel if main_channel.startswith("-100") else (main_channel if main_channel.startswith("@") else None)
     
     if not chat_id:
-        logging.error("Main channel not configured correctly for post")
+        logging.error("Channel not configured correctly for post")
         return
 
     try:
@@ -1608,6 +1693,36 @@ async def send_channel_post(context: ContextTypes.DEFAULT_TYPE):
         if data.get('admin_id'):
             await context.bot.send_message(data['admin_id'], f"❌ Post yuborishda xatolik: {e}")
 
+async def send_post_to_channel_immediate(context: ContextTypes.DEFAULT_TYPE, data: dict):
+    target_channel = data.get("target_channel")
+    chat_id = None
+    if target_channel:
+        chat_id = target_channel if target_channel.startswith("-100") else target_channel
+    else:
+        main_channel = get_bot_setting("main_channel")
+        if not main_channel:
+            main_channel = CHANNEL_USERNAME
+        chat_id = main_channel if main_channel.startswith("-100") else (main_channel if main_channel.startswith("@") else None)
+    if not chat_id:
+        return False, "Channel not configured"
+    try:
+        bot_username = context.bot.username
+        url = f"https://t.me/{bot_username}?start={data['code']}"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(data['btn_text'], url=url)]])
+        if data['file_type'] == "photo":
+            await context.bot.send_photo(chat_id=chat_id, photo=data['file_id'], caption=data['caption'], parse_mode='HTML', reply_markup=keyboard)
+        elif data['file_type'] == "video":
+            await context.bot.send_video(chat_id=chat_id, video=data['file_id'], caption=data['caption'], parse_mode='HTML', reply_markup=keyboard)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=data['caption'], parse_mode='HTML', reply_markup=keyboard, disable_web_page_preview=True)
+        if data.get('admin_id'):
+            await context.bot.send_message(data['admin_id'], "✅ Post kanalga yuborildi!")
+        return True, ""
+    except Exception as e:
+        if data.get('admin_id'):
+            await context.bot.send_message(data['admin_id'], f"❌ Post yuborishda xatolik: {e}")
+        return False, str(e)
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1616,6 +1731,49 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "post_cancel":
         context.user_data.clear()
         await query.message.edit_text("❌ Post yaratish bekor qilindi.")
+        return
+
+    if query.data.startswith("post_target_idx_"):
+        if not has_permission(user_id, "POST_CREATE"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+            return
+        
+        try:
+            idx = int(query.data.replace("post_target_idx_", ""))
+        except ValueError:
+            await query.answer("Noto'g'ri kanal tanlovi!", show_alert=True)
+            return
+        
+        channels = context.user_data.get("post_available_channels")
+        if not channels or idx < 0 or idx >= len(channels):
+            await query.answer("Kanal topilmadi. Qaytadan urinib ko'ring.", show_alert=True)
+            return
+        
+        username, ch_type, display_name, invite_link = channels[idx]
+        context.user_data["post_target_channel"] = username
+        name = display_name if display_name else username
+        
+        schedule_keyboard = [
+            [InlineKeyboardButton("Hozir yuborish", callback_data="post_schedule_now")],
+            [InlineKeyboardButton("1 soatdan keyin", callback_data="post_schedule_1h"),
+             InlineKeyboardButton("2 soatdan keyin", callback_data="post_schedule_2h")],
+            [InlineKeyboardButton("3 soatdan keyin", callback_data="post_schedule_3h"),
+             InlineKeyboardButton("4 soatdan keyin", callback_data="post_schedule_4h")],
+            [InlineKeyboardButton("5 soatdan keyin", callback_data="post_schedule_5h"),
+             InlineKeyboardButton("6 soatdan keyin", callback_data="post_schedule_6h")],
+            [InlineKeyboardButton("7 soatdan keyin", callback_data="post_schedule_7h"),
+             InlineKeyboardButton("8 soatdan keyin", callback_data="post_schedule_8h")],
+            [InlineKeyboardButton("9 soatdan keyin", callback_data="post_schedule_9h"),
+             InlineKeyboardButton("10 soatdan keyin", callback_data="post_schedule_10h")],
+             [InlineKeyboardButton("❌ Bekor qilish", callback_data="post_cancel")]
+        ]
+        
+        await query.message.edit_text(
+            f"📡 <b>KANAL TANLANDI:</b> {name}\n\n"
+            "⏰ Qachon yuborilsin?",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(schedule_keyboard)
+        )
         return
 
     if query.data.startswith("post_schedule_"):
@@ -1632,11 +1790,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "caption": context.user_data.get("post_caption"),
             "btn_text": context.user_data.get("post_btn_text"),
             "code": context.user_data.get("post_code"),
-            "admin_id": user_id
+            "admin_id": user_id,
+            "target_channel": context.user_data.get("post_target_channel")
         }
         
-        if not post_data["code"]:
-             await query.message.edit_text("❌ Ma'lumotlar yo'qolgan. Qaytadan urinib ko'ring.")
+        if not post_data["code"] or not post_data["target_channel"]:
+             await query.message.edit_text("❌ Ma'lumotlar yo'qolgan. Kanal va kodni qaytadan belgilang.")
              return
 
         delay = 0
@@ -1650,21 +1809,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delay = hours * 3600
             msg_text = f"✅ Post {hours} soatdan keyin yuboriladi."
         
-        context.job_queue.run_once(send_channel_post, delay, data=post_data)
-        
-        await query.message.edit_text(msg_text)
-        context.user_data.clear()
+        if delay == 0:
+            ok, err = await send_post_to_channel_immediate(context, post_data)
+            if ok:
+                await query.message.edit_text("✅ Post yuborildi!")
+            else:
+                await query.message.edit_text(f"❌ Xatolik: {err}")
+            context.user_data.clear()
+        else:
+            context.job_queue.run_once(send_channel_post, delay, data=post_data)
+            await query.message.edit_text(msg_text)
+            context.user_data.clear()
         return
 
-    # 1. Membership check for ALL users (except when checking membership itself)
-    if query.data != "check_membership":
+    # 1. Membership check (admins are exempt)
+    if query.data != "check_membership" and not is_admin(user_id):
         not_joined = await is_member(user_id)
         if not_joined:
             await query.answer("⚠️ Avval kanallarga a'zo bo'ling!", show_alert=True)
-            # We can also send a fresh message with the keyboard if needed, 
-            # but usually an alert is enough for button clicks, 
-            # or we can edit the message to show subscription keyboard.
-            # Let's edit the message to force attention.
             try:
                 await query.message.edit_text(
                     "⚠️ <b>DIQQAT!</b>\n\n"
@@ -1674,7 +1836,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=get_subscription_keyboard(not_joined)
                 )
             except:
-                # If message content is same or other error
                 await query.message.reply_text(
                     "⚠️ <b>DIQQAT!</b>\n\n"
                     "Siz botning majburiy kanallaridan chiqib ketgansiz.\n"
@@ -1938,6 +2099,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             os.remove(csv_file)
             log_admin_action(user_id, "Admin loglari yuklab olindi", "")
+
+    elif query.data == "download_blocked":
+        if not has_permission(user_id, "LOGS_DOWNLOAD"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            await query.message.edit_text("📥 Bloklanganlar fayli tayyorlanmoqda...")
+            c.execute("SELECT user_id, blocked_by, blocked_date, reason FROM blocked_users ORDER BY blocked_date DESC")
+            rows = c.fetchall()
+            csv_file = "blocked_users.csv"
+            admin_count = 0
+            auto_count = 0
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["category", "user_id", "blocked_by", "blocked_date", "reason"])
+                for uid, by, date, reason in rows:
+                    category = "bot_blocked" if (reason == "bot_blocked" or by == 0) else "admin_blocked"
+                    if category == "bot_blocked":
+                        auto_count += 1
+                    else:
+                        admin_count += 1
+                    writer.writerow([category, uid, by, date, reason or ""])
+                writer.writerow([])
+                writer.writerow(["summary", f"admin_blocked={admin_count}", f"bot_blocked={auto_count}", f"total={len(rows)}"])
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=open(csv_file, "rb"),
+                filename="blocked_users.csv",
+                caption="⛔ Bloklanganlar ro'yxati (kategoriya bilan)"
+            )
+            os.remove(csv_file)
+            log_admin_action(user_id, "Bloklanganlar fayli yuklandi", f"admin={admin_count}, bot={auto_count}, total={len(rows)}")
+
+    elif query.data == "reset_db":
+        await query.answer("Bu funksiya o'chirilgan.", show_alert=True)
+    elif query.data == "confirm_reset_db":
+        await query.answer("Bu funksiya o'chirilgan.", show_alert=True)
 
     elif query.data == "admin_perms":
         if not has_permission(user_id, "ADMIN_ADD"):
@@ -2263,6 +2460,108 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML'
             )
             context.user_data["waiting_film_code_edit"] = True
+    
+    elif query.data.startswith("film_edit_caption_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            film_code = query.data.replace("film_edit_caption_", "")
+            context.user_data["edit_film_code"] = film_code
+            context.user_data["waiting_new_caption"] = True
+            await query.message.edit_text("Yangi captionni yuboring:", parse_mode='HTML')
+
+    elif query.data.startswith("film_edit_file_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            film_code = query.data.replace("film_edit_file_", "")
+            context.user_data["edit_film_code"] = film_code
+            context.user_data["waiting_main_film_file_update"] = True
+            await query.message.edit_text("Yangi film faylini (video/hujjat) yuboring:", parse_mode='HTML')
+
+    elif query.data.startswith("film_parts_list_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            film_code = query.data.replace("film_parts_list_", "")
+            parts = get_film_parts(film_code)
+            if not parts:
+                await query.message.edit_text("❌ Bu filmda qismlar yo'q!", reply_markup=get_film_settings_keyboard())
+            else:
+                keyboard = []
+                for part_number, file_id, file_type, caption in parts:
+                    keyboard.append([
+                        InlineKeyboardButton(f"✏️ {part_number}-qismni tahrirlash", callback_data=f"part_edit_{film_code}_{part_number}")
+                    ])
+                    keyboard.append([
+                        InlineKeyboardButton(f"🗑 {part_number}-qismni o'chirish", callback_data=f"part_delete_{film_code}_{part_number}")
+                    ])
+                keyboard.append([InlineKeyboardButton("⬅ Orqaga", callback_data="show_film_settings")])
+                await query.message.edit_text("🧩 Qismlar:", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data.startswith("part_edit_file_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            suffix = query.data.replace("part_edit_file_", "", 1)
+            film_code, part_num = suffix.rsplit("_", 1)
+            part_number = int(part_num)
+            context.user_data["edit_part_film_code"] = film_code
+            context.user_data["edit_part_number"] = part_number
+            context.user_data["waiting_part_file_update"] = True
+            await query.message.edit_text("Yangi faylni (video/hujjat) yuboring:", parse_mode='HTML')
+
+    elif query.data.startswith("part_edit_caption_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            suffix = query.data.replace("part_edit_caption_", "", 1)
+            film_code, part_num = suffix.rsplit("_", 1)
+            part_number = int(part_num)
+            context.user_data["edit_part_film_code"] = film_code
+            context.user_data["edit_part_number"] = part_number
+            context.user_data["waiting_part_caption_update"] = True
+            await query.message.edit_text("Yangi captionni yuboring:", parse_mode='HTML')
+
+    elif query.data.startswith("part_edit_"):
+        if not has_permission(user_id, "FILM_EDIT"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            suffix = query.data.replace("part_edit_", "", 1)
+            film_code, part_num = suffix.rsplit("_", 1)
+            part_number = int(part_num)
+            context.user_data["edit_part_film_code"] = film_code
+            context.user_data["edit_part_number"] = part_number
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎞 Faylni yangilash", callback_data=f"part_edit_file_{film_code}_{part_number}")],
+                [InlineKeyboardButton("✏️ Captionni tahrirlash", callback_data=f"part_edit_caption_{film_code}_{part_number}")],
+                [InlineKeyboardButton("⬅ Orqaga", callback_data=f"film_parts_list_{film_code}")]
+            ])
+            await query.message.edit_text(f"{part_number}-qism uchun amal tanlang:", parse_mode='HTML', reply_markup=keyboard)
+
+    elif query.data.startswith("part_delete_"):
+        if not has_permission(user_id, "FILM_DELETE"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            suffix = query.data.replace("part_delete_", "", 1)
+            film_code, part_num = suffix.rsplit("_", 1)
+            part_number = int(part_num)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"confirm_del_part_{film_code}_{part_number}")],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"film_parts_list_{film_code}")]
+            ])
+            await query.message.edit_text(f"{part_number}-qismni o'chirishni tasdiqlaysizmi?", parse_mode='HTML', reply_markup=keyboard)
+
+    elif query.data.startswith("confirm_del_part_"):
+        if not has_permission(user_id, "FILM_DELETE"):
+            await query.answer("Sizda ruxsat yo'q!", show_alert=True)
+        else:
+            suffix = query.data.replace("confirm_del_part_", "", 1)
+            film_code, part_num = suffix.rsplit("_", 1)
+            part_number = int(part_num)
+            delete_film_part(film_code, part_number)
+            log_admin_action(user_id, "Film qismi o'chirildi", f"Kod: {film_code}, Part: {part_number}")
+            await query.message.edit_text("✅ Qism o'chirildi!", parse_mode='HTML', reply_markup=get_film_settings_keyboard())
 
     elif query.data == "film_search":
         await query.message.edit_text(
@@ -2400,7 +2699,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "cancel_action":
         context.user_data.clear()
-        await query.message.edit_text("🚫 Amal bekor qilindi.", reply_markup=get_admin_main_keyboard())
+        await query.message.edit_text(
+            "🚫 Amal bekor qilindi.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Orqaga", callback_data="back_main")]
+            ])
+        )
 
     elif query.data == "approve_ad":
         if not has_permission(user_id, "AD_SEND"):
@@ -2460,7 +2764,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("SELECT user_id FROM blocked_users")
             blocked_set = set(row[0] for row in c.fetchall())
             
-            success_count, failed_ids, skipped_blocked, auto_blocked = await broadcast_to_users(
+            success_count, failed_ids, skipped_blocked, skipped_unreachable = await broadcast_to_users(
                 context=context,
                 users=users,
                 payload=payload,
@@ -2469,7 +2773,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             failed_count = len(failed_ids)
-            not_sent = skipped_blocked + auto_blocked + failed_count
+            not_sent = skipped_blocked + skipped_unreachable + failed_count
             
             if failed_ids:
                 save_last_ad_state(user_id, payload, failed_ids, buttons_serialized)
@@ -2487,7 +2791,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📊 Jami user: <b>{len(users)}</b>\n"
                 f"✅ Yuborildi: <b>{success_count}</b>\n"
                 f"🚫 Bloklangan (DB): <b>{skipped_blocked}</b>\n"
-                f"⛔️ Bot bloklagan (auto): <b>{auto_blocked}</b>\n"
+                f"⏭ Yetib bormagan (o'tkazib yuborildi): <b>{skipped_unreachable}</b>\n"
                 f"❌ Yuborilmadi (xato): <b>{failed_count}</b>\n"
                 f"📌 Umumiy yuborilmadi: <b>{not_sent}</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2519,7 +2823,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("SELECT user_id FROM blocked_users")
             blocked_set = set(row[0] for row in c.fetchall())
             
-            success_count, new_failed_ids, skipped_blocked, auto_blocked = await broadcast_to_users(
+            success_count, new_failed_ids, skipped_blocked, skipped_unreachable = await broadcast_to_users(
                 context=context,
                 users=failed_ids,
                 payload=payload,
@@ -2528,7 +2832,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             failed_count = len(new_failed_ids)
-            not_sent = skipped_blocked + auto_blocked + failed_count
+            not_sent = skipped_blocked + skipped_unreachable + failed_count
             
             if new_failed_ids:
                 save_last_ad_state(user_id, payload, new_failed_ids, state.get("buttons", []))
@@ -2546,7 +2850,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📊 Qayta yuborish ro'yxati: <b>{len(failed_ids)}</b>\n"
                 f"✅ Yuborildi: <b>{success_count}</b>\n"
                 f"🚫 Bloklangan (DB): <b>{skipped_blocked}</b>\n"
-                f"⛔️ Bot bloklagan (auto): <b>{auto_blocked}</b>\n"
+                f"⏭ Yetib bormagan (o'tkazib yuborildi): <b>{skipped_unreachable}</b>\n"
                 f"❌ Yuborilmadi (xato): <b>{failed_count}</b>\n"
                 f"📌 Umumiy yuborilmadi: <b>{not_sent}</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
