@@ -42,6 +42,7 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set! Please add your bot token to .env or Replit Secrets.")
